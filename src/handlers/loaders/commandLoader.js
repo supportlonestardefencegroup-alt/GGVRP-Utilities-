@@ -62,7 +62,7 @@ export async function loadCommands(client) {
     
     for (const filePath of commandFiles) {
         try {
-            const normalizedPath = filePath.replace(/\\\\/g, '/');
+            const normalizedPath = filePath.replace(/\\\\\\\\/g, '/');
             
             const commandName = path.basename(filePath, '.js');
             const commandDir = path.dirname(filePath);
@@ -221,17 +221,18 @@ function validateCommands(commands) {
     }
 }
 
-function prepareCommandsForGlobalRegistration(commands) {
-    if (commands.length >= COMMAND_COUNT_WARN_THRESHOLD) {
-        logger.warn(`Command count (${commands.length}) is near Discord's ${MAX_GLOBAL_COMMANDS} global command limit`);
-    }
-
+function splitCommandsForRegistration(commands) {
     if (commands.length <= MAX_GLOBAL_COMMANDS) {
-        return commands;
+        return { globalCommands: commands, guildCommands: [] };
     }
 
     logger.warn(`Command count (${commands.length}) exceeds Discord's ${MAX_GLOBAL_COMMANDS} global command limit`);
-    return null; // Signal to use guild registration instead
+    logger.info(`Splitting: ${MAX_GLOBAL_COMMANDS} commands for global registration, ${commands.length - MAX_GLOBAL_COMMANDS} for guild-level`);
+    
+    const globalCommands = commands.slice(0, MAX_GLOBAL_COMMANDS);
+    const guildCommands = commands.slice(MAX_GLOBAL_COMMANDS);
+    
+    return { globalCommands, guildCommands };
 }
 
 async function registerGlobalCommands(client, clientId, commands, totalSubcommands) {
@@ -243,28 +244,25 @@ async function registerGlobalCommands(client, clientId, commands, totalSubcomman
         throw new Error('Discord REST client is not available for slash command registration');
     }
 
-    logger.info(`Preparing to register ${totalSubcommands + commands.length} commands globally`);
+    if (commands.length === 0) {
+        logger.info('No global commands to register');
+        return { registeredCount: 0, registrationMethod: 'none' };
+    }
+
+    logger.info(`Registering ${commands.length} global commands...`);
     logger.info('Validating commands before registration...');
     validateCommands(commands);
     logger.info('Command validation passed');
-
-    const commandsToRegister = prepareCommandsForGlobalRegistration(commands);
-
-    if (commandsToRegister === null) {
-        logger.info('Too many commands for global registration; will register at guild level instead');
-        return { registeredCount: 0, registrationMethod: 'guild' };
-    }
 
     if (botConfig.commands?.deleteCommands) {
         logger.info('Clearing existing global commands before registration...');
         await client.rest.put(`/applications/${clientId}/commands`, { body: [] });
     }
 
-    logger.info(`Registering ${commandsToRegister.length} global commands...`);
-    await client.rest.put(`/applications/${clientId}/commands`, { body: commandsToRegister });
-    logger.info(`Successfully registered ${commandsToRegister.length} global commands`);
+    await client.rest.put(`/applications/${clientId}/commands`, { body: commands });
+    logger.info(`Successfully registered ${commands.length} global commands`);
     logger.info('Global commands may take up to an hour to appear in all servers on first deploy');
-    return { registeredCount: commandsToRegister.length, registrationMethod: 'global' };
+    return { registeredCount: commands.length, registrationMethod: 'global' };
 }
 
 async function registerGuildCommands(client, clientId, guildId, commands, totalSubcommands) {
@@ -276,7 +274,12 @@ async function registerGuildCommands(client, clientId, guildId, commands, totalS
         throw new Error('Discord REST client is not available for slash command registration');
     }
 
-    logger.info(`Preparing to register ${totalSubcommands + commands.length} commands for guild ${guildId}`);
+    if (commands.length === 0) {
+        logger.info('No guild-specific commands to register');
+        return { registeredCount: 0, registrationMethod: 'none' };
+    }
+
+    logger.info(`Registering ${commands.length} guild-specific commands for guild ${guildId}...`);
     logger.info('Validating commands before registration...');
     validateCommands(commands);
     logger.info('Command validation passed');
@@ -286,7 +289,6 @@ async function registerGuildCommands(client, clientId, guildId, commands, totalS
         await client.rest.put(`/applications/${clientId}/guilds/${guildId}/commands`, { body: [] });
     }
 
-    logger.info(`Registering ${commands.length} guild-specific commands for guild ${guildId}...`);
     await client.rest.put(`/applications/${clientId}/guilds/${guildId}/commands`, { body: commands });
     logger.info(`Successfully registered ${commands.length} guild-specific commands`);
     logger.info('Guild-specific commands appear instantly (no 1 hour delay)');
@@ -299,16 +301,29 @@ export async function registerCommands(client, options = {}) {
     try {
         const { commands, totalSubcommands } = collectCommandPayloads(client);
         
-        // Check if we need guild-level registration
-        const guildId = process.env.GUILD_ID || client.config?.bot?.guildId;
-        const needsGuildRegistration = commands.length > MAX_GLOBAL_COMMANDS && guildId;
-
-        if (needsGuildRegistration) {
-            logger.info(`Guild ID detected (${guildId}). Attempting guild-level registration for ${commands.length} commands...`);
-            return await registerGuildCommands(client, clientId, guildId, commands, totalSubcommands);
-        } else {
-            return await registerGlobalCommands(client, clientId, commands, totalSubcommands);
+        logger.info(`Preparing to register ${commands.length} total commands`);
+        
+        // Split commands: up to 100 global, rest for guild
+        const { globalCommands, guildCommands } = splitCommandsForRegistration(commands);
+        
+        // Always register global commands first
+        const globalResult = await registerGlobalCommands(client, clientId, globalCommands, 0);
+        
+        // Register guild-specific commands if there are any overflow
+        let guildResult = { registeredCount: 0, registrationMethod: 'none' };
+        if (guildCommands.length > 0) {
+            const guildId = process.env.GUILD_ID || client.config?.bot?.guildId;
+            if (!guildId) {
+                logger.warn(`${guildCommands.length} commands need guild-level registration, but GUILD_ID is not set. These commands will not be available.`);
+            } else {
+                guildResult = await registerGuildCommands(client, clientId, guildId, guildCommands, 0);
+            }
         }
+        
+        const totalRegistered = globalResult.registeredCount + guildResult.registeredCount;
+        logger.info(`Registration complete: ${globalResult.registeredCount} global + ${guildResult.registeredCount} guild-level = ${totalRegistered} total commands registered`);
+        
+        return { globalResult, guildResult, totalRegistered };
     } catch (error) {
         logger.error('Error registering commands:', error);
         throw error;
@@ -338,3 +353,4 @@ export async function reloadCommand(client, commandName) {
         return { success: false, message: `Error reloading command: ${error.message}` };
     }
 }
+
